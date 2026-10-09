@@ -166,6 +166,7 @@ header{padding:12px 20px;gap:22px;border-bottom:1px solid var(--line);background
 svg.links line.sel,svg.links line.temp{stroke:var(--me)}
 @media (max-width:700px){ .brand{display:none} .tabs{gap:14px} }
 body{margin:0}
+[hidden]{display:none!important}
 .gate{position:fixed;inset:0;z-index:50;background:var(--paper);display:grid;place-items:center;padding:24px 16px}
 .gate form{width:min(420px,100%);display:flex;flex-direction:column;gap:14px}
 .gate .w1{font-weight:900;font-size:30px;letter-spacing:-.8px;line-height:1.05}
@@ -491,6 +492,20 @@ async function unseal(key, s){ const [iv,ct]=s.split('.'); return td.decode(awai
 
 // Text and names are encrypted in the browser; positions, colours and links are stored as-is.
 const SECRET=['text','name'];
+// Local mode (no Firebase yet): same interface, stored in this browser's localStorage only.
+function localStore(){
+  const K='grv-local-db'; let all={}; try{ all=JSON.parse(localStorage.getItem(K)||'{}'); }catch(e){}
+  const subs={}; const parent=p=>p.split('/').slice(0,-1).join('/');
+  const persist=()=>{ try{ localStorage.setItem(K,JSON.stringify(all)); }catch(e){} };
+  const emit=c=>(subs[c]||[]).forEach(f=>f());
+  const snap=c=>{ const docs=Object.keys(all).filter(k=>parent(k)===c).map(k=>({id:k.split('/').pop(),data:()=>all[k]})); return {docs,size:docs.length,empty:!docs.length}; };
+  return {
+    doc:p=>({ set:async d=>{ all[p]=JSON.parse(JSON.stringify(d)); persist(); emit(parent(p)); },
+              update:async d=>{ all[p]=Object.assign(all[p]||{},JSON.parse(JSON.stringify(d))); persist(); emit(parent(p)); },
+              delete:async()=>{ delete all[p]; persist(); emit(parent(p)); } }),
+    collection:c=>({ onSnapshot:next=>{ const f=()=>next(snap(c)); (subs[c]||=[]).push(f); setTimeout(f,0); return ()=>{ subs[c]=subs[c].filter(x=>x!==f); }; } })
+  };
+}
 function makeDb(fs, key){
   const enc=async d=>{ const o={}; for(const [k,v] of Object.entries(d)){ if(SECRET.includes(k)&&typeof v==='string') o[k+'_ct']=await seal(key,v); else o[k]=v; } return o; };
   const dec=async d=>{ const o={}; for(const [k,v] of Object.entries(d||{})){ const m=k.match(/^(.*)_ct$/); if(m&&SECRET.includes(m[1])){ try{ o[m[1]]=await unseal(key,v); }catch(e){ o[m[1]]='[could not decrypt]'; } } else o[k]=v; } return o; };
@@ -510,7 +525,9 @@ async function launch(key, enc, name){
   let MODS; try{ MODS=await openSyllabus(key, enc); }catch(e){ return false; }
   let uid=lsGet('grv-uid'); if(!uid){ uid='u'+crypto.getRandomValues(new Uint32Array(2)).join(''); lsSet('grv-uid',uid); }
   lsSet('grv-name',name);
-  const fs=getFirestore(initializeApp(FIREBASE_CONFIG)); const db=makeDb(fs,key);
+  const LOCAL=!(FIREBASE_CONFIG&&FIREBASE_CONFIG.projectId);
+  const db=LOCAL?localStore():makeDb(getFirestore(initializeApp(FIREBASE_CONFIG)),key);
+  if(LOCAL) setTimeout(()=>{ const s=document.getElementById('status'); s.hidden=false; s.textContent='Local mode: notes are saved in this browser only, until the shared database is connected.'; setTimeout(()=>s.hidden=true,8000); },300);
   db.doc('people/'+uid).set({name,at:Date.now()}).catch(()=>{});
   const people={}; const PEOPLE={get:()=>people};
   db.collection('people').onSnapshot(s=>{ for(const d of s.docs) people[d.id]=d.data(); window.grvRefresh&&window.grvRefresh(); },()=>{});
@@ -519,8 +536,10 @@ async function launch(key, enc, name){
 }
 
 (async()=>{
-  if(!FIREBASE_CONFIG||!FIREBASE_CONFIG.projectId){ msg.textContent='This site isn’t connected to its database yet: config.js still needs the Firebase settings.'; form.querySelector('button').disabled=true; return; }
+  if(!FIREBASE_CONFIG||!FIREBASE_CONFIG.projectId) msg.textContent='Local mode: the shared database isn’t connected yet, so notes stay in this browser.';
   const enc=await (await fetch('syllabus.enc.json',{cache:'no-cache'})).json();
+  // On your own computer the passphrase file sits next to the page (it is never pushed to GitHub), so skip the login.
+  try{ const r=await fetch('PASSPHRASE.txt',{cache:'no-cache'}); if(r.ok&&/^(localhost|127\.0\.0\.1)$/.test(location.hostname)){ const key=await deriveKey((await r.text()).trim(),enc); if(await launch(key,enc,lsGet('grv-name')||'Fernanda')) return; } }catch(e){ console.error('local unlock failed',e); }
   const saved=lsGet('grv-key'), name=lsGet('grv-name');
   if(saved&&name){ try{ const key=await crypto.subtle.importKey('raw',unb64(saved),'AES-GCM',true,['encrypt','decrypt']); if(await launch(key,enc,name)) return; }catch(e){} lsSet('grv-key',null); }
   gate.hidden=false;
